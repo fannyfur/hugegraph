@@ -62,6 +62,7 @@ import com.baidu.hugegraph.serializer.JsonSerializer;
 import com.baidu.hugegraph.serializer.Serializer;
 import com.baidu.hugegraph.server.RestServer;
 import com.baidu.hugegraph.task.TaskManager;
+import com.baidu.hugegraph.type.define.GraphMode;
 import com.baidu.hugegraph.type.define.NodeRole;
 import com.baidu.hugegraph.util.ConfigUtil;
 import com.baidu.hugegraph.util.E;
@@ -82,13 +83,37 @@ public final class GraphManager {
         this.graphs = new ConcurrentHashMap<>();
         this.authenticator = HugeAuthenticator.loadAuthenticator(conf);
         this.eventHub = hub;
-
+        this.listenChanges();
         this.loadGraphs(ConfigUtil.scanGraphsDir(this.graphsDir));
         // this.installLicense(conf, "");
         this.waitGraphsStarted();
         this.checkBackendVersionOrExit();
         this.serverStarted(conf);
         this.addMetrics(conf);
+    }
+
+    public void destroy() {
+        this.unlistenChanges();
+    }
+
+    private void listenChanges() {
+        this.eventHub.listen(Events.GRAPH_CREATE, event -> {
+            event.checkArgs(HugeGraph.class);
+            HugeGraph graph = (HugeGraph) event.args()[0];
+            this.graphs.put(graph.name(), graph);
+            return null;
+        });
+        this.eventHub.listen(Events.GRAPH_DROP, event -> {
+            event.checkArgs(String.class);
+            String name = (String) event.args()[0];
+            this.graphs.remove(name);
+            return null;
+        });
+    }
+
+    private void unlistenChanges() {
+        this.eventHub.unlisten(Events.GRAPH_CREATE);
+        this.eventHub.unlisten(Events.GRAPH_DROP);
     }
 
     public void loadGraphs(final Map<String, String> graphConfs) {
@@ -149,6 +174,30 @@ public final class GraphManager {
         return this.createGraph(config);
     }
 
+    private HugeGraph createGraph(HugeConfig config) {
+        // open succeed will fill graph instance into HugeFactory graphs(map)
+        HugeGraph graph = (HugeGraph) GraphFactory.open(config);
+        if (this.requireAuthentication()) {
+            /*
+             * The main purpose is to call method
+             * verifyPermission(HugePermission.WRITE, ResourceType.STATUS)
+             * that is private
+             */
+            graph.mode(GraphMode.NONE);
+        }
+        try {
+            graph.initBackend();
+        } catch (BackendException e) {
+            HugeFactory.remove(graph);
+            throw e;
+        }
+        // Let gremlin server and rest server context add graph
+        this.eventHub.call(Events.GRAPH_CREATE, graph);
+        // Write config to disk file
+        ConfigUtil.writeToFile(this.graphsDir, graph.name(), config);
+        return graph;
+    }
+
     private PropertiesConfiguration buildConfig(String configText) {
         PropertiesConfiguration propConfig = new PropertiesConfiguration();
         try {
@@ -160,31 +209,6 @@ public final class GraphManager {
             throw new IllegalStateException("Failed to read config options", e);
         }
         return propConfig;
-    }
-
-    private HugeGraph createGraph(HugeConfig config) {
-        // open succeed will fill graph instance into HugeFactory graphs(map)
-        HugeGraph graph = (HugeGraph) GraphFactory.open(config);
-        if (this.requireAuthentication()) {
-            if (graph instanceof HugeGraphAuthProxy) {
-                HugeGraphAuthProxy proxy = (HugeGraphAuthProxy) graph;
-                // TODO：verfiyPermission is private
-                // proxy.verifyPermission(HugePermission.WRITE, ResourceType.STATUS);
-            }
-        }
-        try {
-            graph.initBackend();
-        } catch (BackendException e) {
-            HugeFactory.remove(graph);
-            throw e;
-        }
-        // Inject into gremlin server context
-        this.eventHub.call(Events.GRAPH_CREATE, graph);
-        // Inject into rest server context
-        this.graphs.put(graph.name(), graph);
-        // Write config to disk file
-        ConfigUtil.writeToFile(this.graphsDir, graph.name(), config);
-        return graph;
     }
 
     private void checkOptions(HugeConfig config) {
@@ -210,11 +234,8 @@ public final class GraphManager {
         } catch (Exception e) {
             LOG.warn("Failed to close graph", e);
         }
-        // Inject into gremlin server context
+        // Let gremlin server and rest server context remove graph
         this.eventHub.call(Events.GRAPH_DROP, name);
-        // Inject into rest server context
-        this.graphs.remove(name);
-
         HugeConfig config = (HugeConfig) g.configuration();
         ConfigUtil.deleteFile(config.getFile());
     }
